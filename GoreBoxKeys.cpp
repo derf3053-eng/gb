@@ -6,6 +6,7 @@
 // INSERT       — показать / скрыть оверлей
 // ЛКМ          — RGB-кубики в месте нажатия мыши
 // F8           — тестовый запуск RGB-кубиков в центре экрана
+// F7           — включить / выключить постоянно парящие частицы
 // CTRL+ALT+F12 — закрыть оверлей
 //
 // Сборка:
@@ -29,6 +30,57 @@ struct Particle {
 
 static const int MAX_PARTICLES = 80;
 static Particle particles[MAX_PARTICLES] = {};
+
+// Небольшие декоративные частицы, постоянно парящие по экрану.
+// Это 2D-эффект поверх игры, а не реальные объекты игрового мира.
+struct AmbientParticle {
+    float x, y;
+    float vx, vy;
+    float phase;
+    float hue;
+    float speed;
+    int size;
+};
+
+static const int AMBIENT_COUNT = 58;
+static AmbientParticle ambientParticles[AMBIENT_COUNT] = {};
+static bool g_ambientEnabled = true;
+static unsigned int g_randomSeed = 0xA341316Cu;
+
+static unsigned int RandomNext()
+{
+    g_randomSeed = g_randomSeed * 1664525u + 1013904223u;
+    return g_randomSeed;
+}
+
+static float RandomFloat(float minValue, float maxValue)
+{
+    const float unit = (RandomNext() & 0x00FFFFFFu) / 16777215.0f;
+    return minValue + (maxValue - minValue) * unit;
+}
+
+static void InitAmbientParticles(int width, int height)
+{
+    for (int i = 0; i < AMBIENT_COUNT; ++i) {
+        AmbientParticle& p = ambientParticles[i];
+        p.x = RandomFloat(0.0f, (float)width);
+        p.y = RandomFloat(0.0f, (float)height);
+        p.vx = RandomFloat(-0.32f, 0.32f);
+        p.vy = RandomFloat(-0.65f, -0.12f);
+        p.phase = RandomFloat(0.0f, 6.28318f);
+        p.hue = RandomFloat(0.48f, 0.82f);
+        p.speed = RandomFloat(0.65f, 1.45f);
+        p.size = (int)RandomFloat(2.0f, 5.0f);
+    }
+}
+
+static COLORREF DimColor(COLORREF color, float amount)
+{
+    int r = (int)(GetRValue(color) * amount);
+    int g = (int)(GetGValue(color) * amount);
+    int b = (int)(GetBValue(color) * amount);
+    return RGB(r, g, b);
+}
 
 static COLORREF HueColor(float h)
 {
@@ -117,6 +169,7 @@ static DWORD WINAPI OverlayThread(LPVOID)
 
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    InitAmbientParticles(screenW, screenH);
 
     g_hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT |
@@ -186,9 +239,14 @@ static DWORD WINAPI OverlayThread(LPVOID)
             }
         }
 
-        // F8 — тестовый запуск частиц в центре экрана.
+        // F8 — тестовый запуск кубиков в центре экрана.
         if (g_visible && (GetAsyncKeyState(VK_F8) & 1)) {
             SpawnParticles(screenW / 2, screenH / 2);
+        }
+
+        // F7 — включить / выключить постоянные парящие частицы.
+        if (g_visible && (GetAsyncKeyState(VK_F7) & 1)) {
+            g_ambientEnabled = !g_ambientEnabled;
         }
 
         DWORD now = GetTickCount();
@@ -216,6 +274,63 @@ static DWORD WINAPI OverlayThread(LPVOID)
             HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(DC_BRUSH));
             HGDIOBJ oldPen = SelectObject(dc, GetStockObject(DC_PEN));
             SetBkMode(dc, TRANSPARENT);
+
+            // Постоянные парящие частицы — медленно дрейфуют по всему экрану.
+            // Для глубины используются разные размеры и скорости.
+            int ambientAlive = 0;
+            if (g_ambientEnabled) {
+                for (int i = 0; i < AMBIENT_COUNT; ++i) {
+                    AmbientParticle& p = ambientParticles[i];
+
+                    p.phase += dt * 1.15f;
+                    p.x += (p.vx + sinf(p.phase) * 0.10f) *
+                           p.speed * dt * 60.0f;
+                    p.y += p.vy * p.speed * dt * 60.0f;
+
+                    // Перезапуск частицы с противоположной стороны экрана.
+                    if (p.y < -12.0f || p.x < -12.0f || p.x > screenW + 12.0f) {
+                        p.x = RandomFloat(0.0f, (float)screenW);
+                        p.y = (float)screenH + RandomFloat(2.0f, 80.0f);
+                        p.vx = RandomFloat(-0.32f, 0.32f);
+                        p.vy = RandomFloat(-0.65f, -0.12f);
+                        p.hue = RandomFloat(0.48f, 0.82f);
+                        p.speed = RandomFloat(0.65f, 1.45f);
+                        p.size = (int)RandomFloat(2.0f, 5.0f);
+                    }
+
+                    ++ambientAlive;
+
+                    const int x = (int)p.x;
+                    const int y = (int)p.y;
+                    const float twinkle = 0.68f + 0.32f * sinf(p.phase * 1.7f);
+                    const COLORREF tint = HueColor(p.hue + elapsed * 0.025f);
+                    const COLORREF glow = DimColor(tint, 0.34f + twinkle * 0.18f);
+                    const COLORREF core = DimColor(tint, 0.72f + twinkle * 0.28f);
+                    const int size = p.size;
+
+                    // Три уровня свечения и яркая точка в центре.
+                    SetDCBrushColor(dc, glow);
+                    SetDCPenColor(dc, glow);
+                    Ellipse(dc, x - size - 3, y - size - 3,
+                            x + size + 3, y + size + 3);
+
+                    SetDCBrushColor(dc, core);
+                    SetDCPenColor(dc, core);
+                    Ellipse(dc, x - size, y - size,
+                            x + size, y + size);
+
+                    SetDCBrushColor(dc, RGB(235, 249, 255));
+                    SetDCPenColor(dc, RGB(235, 249, 255));
+                    Ellipse(dc, x - 1, y - 1, x + 2, y + 2);
+
+                    // Редкие маленькие крестики-искры.
+                    if (i % 9 == 0 && twinkle > 0.88f) {
+                        SetDCBrushColor(dc, RGB(225, 245, 255));
+                        DrawRect(dc, drawingBrush, x - 4, y, 9, 1);
+                        DrawRect(dc, drawingBrush, x, y - 4, 1, 9);
+                    }
+                }
+            }
 
             // Компактный неоновый прицел: тонкий белый центр + RGB-кант.
             const int cx = screenW / 2;
@@ -325,8 +440,8 @@ static DWORD WINAPI OverlayThread(LPVOID)
                 panelX + 38, panelY + 36,
                 panelX + panelW - 10, panelY + 55
             };
-            swprintf(textBuffer, 96, L"CLICK FX  %d   |   F8: TEST",
-                     aliveParticles);
+            swprintf(textBuffer, 96, L"FLOAT %d  |  CLICK %d  |  F7",
+                     ambientAlive, aliveParticles);
             DrawTextW(dc, textBuffer, -1, &infoRect,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
