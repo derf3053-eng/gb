@@ -8,7 +8,7 @@
 // CTRL+ALT+F12 — закрыть оверлей
 //
 // Сборка:
-// g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
+g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
 
 #include <windows.h>
 #include <math.h>
