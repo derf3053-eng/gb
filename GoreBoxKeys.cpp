@@ -1,32 +1,107 @@
-// GoreBoxKeys.cpp — прозрачный оверлей поверх экрана в виде DLL (GoreBoxKeys.dll).
-// НЕ инжектится в игру и не трогает её память: отдельное окно без рамки, всегда поверх,
-// клики проходят сквозь него в игру.
-// Рисует: пульсирующая рамка по краям экрана + прицел в центре + счётчик времени.
-// Выход из оверлея: Ctrl+Alt+F12.
+// GoreBoxKeys.cpp
+// Отдельный прозрачный визуальный оверлей.
+// Не инжектится в игру и не читает/изменяет её память.
 //
-// ВАЖНО: workflow собирает ТОЛЬКО с -luser32, поэтому здесь используются
-// исключительно функции user32/kernel32 (никаких GDI/D2D/DWrite/DwmApi).
+// Клавиши:
+// INSERT       — показать / скрыть оверлей
+// F8           — тестовый запуск RGB-кубиков (когда оверлей открыт)
+// CTRL+ALT+F12 — закрыть оверлей
 //
-// Сборка (как в GitHub Actions):
-//   g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -luser32
+// Сборка:
+// g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
 
 #include <windows.h>
+#include <math.h>
 #include <wchar.h>
 
-static HWND g_hwnd;
-static bool g_running;
+static HWND g_hwnd = nullptr;
+static volatile bool g_running = false;
+static bool g_visible = false;
 
-// ---- Обработчик окна ----
-static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+struct Particle {
+    float x, y;
+    float vx, vy;
+    float life;
+    float hue;
+    int size;
+};
+
+static const int MAX_PARTICLES = 80;
+static Particle particles[MAX_PARTICLES] = {};
+
+static COLORREF HueColor(float h)
+{
+    h -= floorf(h);
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    int sector = (int)(h * 6.0f);
+    float f = h * 6.0f - sector;
+    float q = 1.0f - f;
+
+    switch (sector % 6) {
+    case 0: r = 1; g = f; b = 0; break;
+    case 1: r = q; g = 1; b = 0; break;
+    case 2: r = 0; g = 1; b = f; break;
+    case 3: r = 0; g = q; b = 1; break;
+    case 4: r = f; g = 0; b = 1; break;
+    case 5: r = 1; g = 0; b = q; break;
+    }
+
+    return RGB((int)(r * 255), (int)(g * 255), (int)(b * 255));
+}
+
+static void DrawRect(HDC dc, HBRUSH brush,
+                     int x, int y, int width, int height)
+{
+    RECT r = { x, y, x + width, y + height };
+    FillRect(dc, &r, brush);
+}
+
+static void SpawnParticles(int cx, int cy)
+{
+    static unsigned int seed = 1234567u;
+
+    for (int i = 0; i < 24; ++i) {
+        int index = -1;
+
+        for (int j = 0; j < MAX_PARTICLES; ++j) {
+            if (particles[j].life <= 0.0f) {
+                index = j;
+                break;
+            }
+        }
+
+        if (index < 0)
+            break;
+
+        seed = seed * 1664525u + 1013904223u;
+        float angle = (seed % 6283u) / 1000.0f;
+
+        seed = seed * 1664525u + 1013904223u;
+        float speed = 2.0f + (seed % 400u) / 100.0f;
+
+        Particle& p = particles[index];
+        p.x = (float)cx;
+        p.y = (float)cy;
+        p.vx = cosf(angle) * speed;
+        p.vy = sinf(angle) * speed;
+        p.life = 1.0f;
+        p.hue = (seed % 1000u) / 1000.0f;
+        p.size = 4 + (int)(seed % 5u);
+    }
+}
+
+static LRESULT CALLBACK WndProc(HWND h, UINT msg,
+                                WPARAM w, LPARAM l)
 {
     if (msg == WM_DESTROY) {
         g_running = false;
+        PostQuitMessage(0);
         return 0;
     }
+
     return DefWindowProcW(h, msg, w, l);
 }
 
-// ---- Поток оверлея ----
 static DWORD WINAPI OverlayThread(LPVOID)
 {
     HINSTANCE hInst = GetModuleHandleW(nullptr);
@@ -35,95 +110,192 @@ static DWORD WINAPI OverlayThread(LPVOID)
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = L"GoreBoxOverlayWnd";
-    // фон = системный цвет окна: он же становится цветовым ключом прозрачности
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
     RegisterClassW(&wc);
 
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
+    const int screenW = GetSystemMetrics(SM_CXSCREEN);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
 
     g_hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        L"GoreBoxOverlayWnd", L"GoreBoxOverlay", WS_POPUP,
-        0, 0, sw, sh, nullptr, nullptr, hInst, nullptr);
-    if (!g_hwnd) return 0;
+        WS_EX_LAYERED | WS_EX_TRANSPARENT |
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"GoreBoxOverlayWnd",
+        L"GoreBox Visuals",
+        WS_POPUP,
+        0, 0, screenW, screenH,
+        nullptr, nullptr, hInst, nullptr
+    );
 
-    // Делаем цвет окна (обычно белый) полностью прозрачным; всё остальное — видимо
-    SetLayeredWindowAttributes(g_hwnd, GetSysColor(COLOR_WINDOW), 255, LWA_COLORKEY);
-    ShowWindow(g_hwnd, SW_SHOW);
+    if (!g_hwnd)
+        return 0;
 
-    const COLORREF keyColor = GetSysColor(COLOR_WINDOW);
-    HBRUSH brushBg     = GetSysColorBrush(COLOR_WINDOW);      // фон (прозрачный)
-    HBRUSH brushDark   = GetSysColorBrush(COLOR_WINDOWTEXT);    // чёрная рамка / прицел
-    HBRUSH brushGray   = GetSysColorBrush(COLOR_GRAYTEXT);      // серая рамка (фаза пульса)
+    // Цвет фона становится прозрачным.
+    SetLayeredWindowAttributes(
+        g_hwnd, GetSysColor(COLOR_WINDOW),
+        255, LWA_COLORKEY
+    );
 
-    DWORD t0 = GetTickCount();
+    // По умолчанию оверлей скрыт до нажатия INSERT.
+    ShowWindow(g_hwnd, SW_HIDE);
+
+    HBRUSH backgroundBrush = GetSysColorBrush(COLOR_WINDOW);
+    HBRUSH drawingBrush = (HBRUSH)GetStockObject(DC_BRUSH);
+
+    const DWORD startTime = GetTickCount();
+    DWORD previousTime = startTime;
+
     g_running = true;
-    wchar_t buf[64];
-    RECT rc;
+    wchar_t textBuffer[96];
 
     while (g_running) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) g_running = false;
+            if (msg.message == WM_QUIT) {
+                g_running = false;
+                break;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        // Выход: Ctrl+Alt+F12
+
+        if (!g_running)
+            break;
+
+        // INSERT переключает видимость оверлея.
+        if (GetAsyncKeyState(VK_INSERT) & 1) {
+            g_visible = !g_visible;
+            ShowWindow(g_hwnd, g_visible ? SW_SHOW : SW_HIDE);
+        }
+
+        // Горячая клавиша полного выхода.
         if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
             (GetAsyncKeyState(VK_MENU) & 0x8000) &&
-            (GetAsyncKeyState(VK_F12) & 0x8000))
+            (GetAsyncKeyState(VK_F12) & 0x8000)) {
             g_running = false;
+            break;
+        }
 
-        double t = (GetTickCount() - t0) / 1000.0;
-        // треугольная "пульсация" 0..1 без математической библиотеки
-        double phase = t * 1.2;
-        phase -= (int)phase;
-        double pulse = phase < 0.5 ? phase * 2.0 : (1.0 - phase) * 2.0;
+        // F8 запускает тестовые частицы только при открытом оверлее.
+        if (g_visible && (GetAsyncKeyState(VK_F8) & 1)) {
+            SpawnParticles(screenW / 2, screenH / 2);
+        }
+
+        DWORD now = GetTickCount();
+        float dt = (now - previousTime) / 1000.0f;
+        previousTime = now;
+        if (dt > 0.05f)
+            dt = 0.05f;
+
+        if (!g_visible) {
+            Sleep(16);
+            continue;
+        }
+
+        const float elapsed = (now - startTime) / 1000.0f;
+        const float hue = fmodf(elapsed * 0.18f, 1.0f);
 
         HDC dc = GetDC(g_hwnd);
         if (dc) {
-            GetClientRect(g_hwnd, &rc);
+            RECT clientRect;
+            GetClientRect(g_hwnd, &clientRect);
+            FillRect(dc, &clientRect, backgroundBrush);
 
-            // 1) заливаем фон ключевым цветом — он прозрачный
-            FillRect(dc, &rc, brushBg);
+            // Уменьшенный RGB-прицел с цветным внешним слоем.
+            const int cx = screenW / 2;
+            const int cy = screenH / 2;
+            const int arm = 10;
+            const int gap = 4;
 
-            // 2) пульсирующая рамка по краям: чёрная <-> серая
-            HBRUSH frameBrush = (pulse < 0.5) ? brushDark : brushGray;
-            int th = 6 + (int)(pulse * 6.0);   // толщина тоже "дышит"
-            RECT r;
-            r.left = 0;        r.top = 0;           r.right = sw;       r.bottom = th;      FillRect(dc, &r, frameBrush);
-            r.left = 0;        r.top = sh - th;    r.right = sw;       r.bottom = sh;      FillRect(dc, &r, frameBrush);
-            r.left = 0;        r.top = 0;           r.right = th;       r.bottom = sh;      FillRect(dc, &r, frameBrush);
-            r.left = sw - th;  r.top = 0;           r.right = sw;       r.bottom = sh;      FillRect(dc, &r, frameBrush);
+            SetDCBrushColor(dc, HueColor(hue));
 
-            // 3) прицел в центре экрана (чёрный, видимый поверх игры)
-            int cx = sw / 2, cy = sh / 2, arm = 18, gap = 5, w = 2;
-            r.left = cx - arm; r.top = cy - w / 2; r.right = cx - gap;  r.bottom = cy + w / 2; FillRect(dc, &r, brushDark);
-            r.left = cx + gap; r.top = cy - w / 2; r.right = cx + arm;  r.bottom = cy + w / 2; FillRect(dc, &r, brushDark);
-            r.left = cx - w / 2; r.top = cy - arm; r.right = cx + w / 2; r.bottom = cy - gap; FillRect(dc, &r, brushDark);
-            r.left = cx - w / 2; r.top = cy + gap; r.right = cx + w / 2; r.bottom = cy + arm; FillRect(dc, &r, brushDark);
+            DrawRect(dc, drawingBrush, cx - arm - 2, cy - 2,
+                     arm - gap + 2, 4);
+            DrawRect(dc, drawingBrush, cx + gap, cy - 2,
+                     arm - gap + 2, 4);
+            DrawRect(dc, drawingBrush, cx - 2, cy - arm - 2,
+                     4, arm - gap + 2);
+            DrawRect(dc, drawingBrush, cx - 2, cy + gap,
+                     4, arm - gap + 2);
 
-            // 4) текст в углу (чёрный текст на белом фоне; белый = прозрачный ключ)
-            swprintf(buf, 64, L"GoreBox overlay  t=%.1f", t);
-            RECT tr = { 16, 16, sw - 16, 48 };
-            DrawTextW(dc, buf, -1, &tr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+            // Светлая тонкая середина прицела.
+            SetDCBrushColor(dc, RGB(255, 255, 255));
+
+            DrawRect(dc, drawingBrush, cx - arm, cy - 1,
+                     arm - gap, 2);
+            DrawRect(dc, drawingBrush, cx + gap, cy - 1,
+                     arm - gap, 2);
+            DrawRect(dc, drawingBrush, cx - 1, cy - arm,
+                     2, arm - gap);
+            DrawRect(dc, drawingBrush, cx - 1, cy + gap,
+                     2, arm - gap);
+
+            // Обновление и отрисовка тестовых кубиков.
+            for (int i = 0; i < MAX_PARTICLES; ++i) {
+                Particle& p = particles[i];
+                if (p.life <= 0.0f)
+                    continue;
+
+                p.x += p.vx * dt * 60.0f;
+                p.y += p.vy * dt * 60.0f;
+                p.vy += 0.10f * dt * 60.0f;
+                p.life -= dt * 1.5f;
+
+                if (p.life <= 0.0f)
+                    continue;
+
+                const COLORREF cubeColor =
+                    HueColor(p.hue + elapsed * 0.25f);
+
+                const int x = (int)p.x;
+                const int y = (int)p.y;
+
+                SetDCBrushColor(dc, cubeColor);
+                DrawRect(dc, drawingBrush, x, y, p.size, p.size);
+
+                // Маленький белый блик.
+                SetDCBrushColor(dc, RGB(255, 255, 255));
+                DrawRect(dc, drawingBrush, x + 1, y + 1, 2, 2);
+            }
+
+            // Небольшая подпись в левом верхнем углу.
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, HueColor(hue));
+
+            swprintf(textBuffer, 96,
+                     L"GoreBox Visuals | %.1f sec", elapsed);
+
+            RECT textRect = { 16, 16, screenW - 16, 48 };
+            DrawTextW(dc, textBuffer, -1, &textRect,
+                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
             ReleaseDC(g_hwnd, dc);
         }
-        Sleep(16);   // ~60 FPS
+
+        Sleep(16);
     }
 
-    DestroyWindow(g_hwnd);
+    if (g_hwnd && IsWindow(g_hwnd))
+        DestroyWindow(g_hwnd);
+
+    g_hwnd = nullptr;
     return 0;
 }
 
-// ---- Точка входа DLL: при загрузке запускаем поток оверлея ----
+// Примечание: запуск потока из DllMain оставлен для совместимости
+// с исходным вариантом проекта.
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
-        HANDLE th = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
-        if (th) CloseHandle(th);
+        DisableThreadLibraryCalls(GetModuleHandleW(nullptr));
+
+        HANDLE thread = CreateThread(
+            nullptr, 0, OverlayThread, nullptr, 0, nullptr
+        );
+
+        if (thread)
+            CloseHandle(thread);
     }
+
     return TRUE;
 }
