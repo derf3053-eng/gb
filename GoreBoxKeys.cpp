@@ -1,189 +1,156 @@
-// GoreBoxKeys v3: инжектируемая DLL без загрузчика и без RVA.
-// Вызывает встроенные режимы игры (GameMaster.ToggleXxx) через il2cpp API по именам.
-// Клавиши: F1 God, F2 Infinite Ammo, F3 Stamina, F4 NoClip, F5 Ignore AI, F6 SlowMo, F7 Hide UI, F8 Cash
-// Лог: %TEMP%\GoreBoxKeys.log
+// Overlay.cpp — прозрачный оверлей поверх экрана (НЕ инжектится в игру, не трогает её память).
+// Отдельный процесс: своё окно, прозрачное, без рамки, всегда поверх, клики сквозь него проходят в игру.
+// Сейчас рисует пример эффекта: мягкое пульсирующее виньетирование по краям экрана + счётчик FPS.
+// Скажи, что добавить (частицы, вспышки при событии, рамка прицела, текст и т.п.) — допишу в Render().
 //
-// Сборка (x64!):
-//   MinGW : g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -luser32
-//   MSVC  : cl /LD /O2 /EHsc GoreBoxKeys.cpp user32.lib /Fe:GoreBoxKeys.dll
+// Сборка (x64):
+//   MinGW: g++ -O2 -municode -mwindows -o Overlay.exe Overlay.cpp -ld2d1 -ldwrite -luser32 -ldwmapi
+//   MSVC : cl /O2 /EHsc Overlay.cpp user32.lib d2d1.lib dwrite.lib dwmapi.lib /Fe:Overlay.exe
+//
+// Запуск: просто запусти Overlay.exe рядом с игрой (можно до или после её запуска).
+// Выход: Ctrl+Alt+F12.
+
 #include <windows.h>
-#include <string.h>
-#include <stdio.h>
- 
-static void LogS(const char* a, const char* b = "")
+#include <dwmapi.h>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <string>
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+static ID2D1Factory* g_factory;
+static ID2D1HwndRenderTarget* g_rt;
+static IDWriteFactory* g_dwrite;
+static IDWriteTextFormat* g_font;
+static HWND g_hwnd;
+static double g_time;
+
+static void CreateDeviceResources(HWND hwnd)
 {
-    char path[MAX_PATH]; GetTempPathA(MAX_PATH, path); strcat(path, "GoreBoxKeys.log");
-    FILE* f = fopen(path, "a"); if (!f) return;
-    fprintf(f, "%s%s\n", a, b); fclose(f);
+    if (g_rt) return;
+    RECT rc; GetClientRect(hwnd, &rc);
+    D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+    g_factory->CreateHwndRenderTarget(
+        D2D1::RenderTargetProperties(),
+        D2D1::HwndRenderTargetProperties(hwnd, size),
+        &g_rt);
 }
-static void LogN(const char* a, long n)
+
+// ---- Сюда добавляются новые визуальные эффекты ----
+static void Render()
 {
-    char buf[64]; sprintf(buf, "%ld", n); LogS(a, buf);
-}
- 
-typedef void* (*f_domain_get)();
-typedef void** (*f_domain_get_assemblies)(void* domain, size_t* count);
-typedef void* (*f_assembly_get_image)(void* assembly);
-typedef const char* (*f_image_get_name)(void* image);
-typedef void* (*f_class_from_name)(void* image, const char* ns, const char* name);
-typedef void* (*f_class_get_method)(void* klass, const char* name, int argc);
-typedef void* (*f_class_get_type)(void* klass);
-typedef void* (*f_type_get_object)(void* type);
-typedef void* (*f_runtime_invoke)(void* method, void* obj, void** params, void** exc);
-typedef void* (*f_class_get_fields)(void* klass, void** iter);
-typedef int (*f_field_get_flags)(void* field);
-typedef void* (*f_field_get_type)(void* field);
-typedef const char* (*f_field_get_name)(void* field);
-typedef void* (*f_class_from_type)(void* type);
-typedef void (*f_field_static_get_value)(void* field, void* value);
-typedef unsigned int (*f_array_length)(void* arr);
- 
-static f_domain_get p_domain_get; static f_domain_get_assemblies p_assemblies;
-static f_assembly_get_image p_image; static f_image_get_name p_image_name;
-static f_class_from_name p_class; static f_class_get_method p_method;
-static f_class_get_type p_class_type; static f_type_get_object p_type_obj;
-static f_runtime_invoke p_invoke;
-static f_class_get_fields p_fields; static f_field_get_flags p_field_flags;
-static f_field_get_type p_field_type; static f_field_get_name p_field_name;
-static f_class_from_type p_class_from_type; static f_field_static_get_value p_static_get;
-static f_array_length p_array_len;
- 
-static WNDPROC g_orig; static HWND g_wnd;
-static void *g_gmClass, *g_findMethod, *g_findAllMethod, *g_objClass;
-static bool g_resolved, g_failed;
- 
-static bool Resolve()
-{
-    if (g_resolved) return true;
-    if (g_failed) return false;
-    HMODULE m = GetModuleHandleA("GameAssembly.dll");
-    if (!m) { LogS("[resolve] GameAssembly.dll not found"); return false; }
-#define NEED(v, n) v = (decltype(v))GetProcAddress(m, n); if (!v) { LogS("[resolve] export missing: ", n); g_failed = true; return false; }
-#define WANT(v, n) v = (decltype(v))GetProcAddress(m, n);
-    NEED(p_domain_get, "il2cpp_domain_get") NEED(p_assemblies, "il2cpp_domain_get_assemblies")
-    NEED(p_image, "il2cpp_assembly_get_image") NEED(p_image_name, "il2cpp_image_get_name")
-    NEED(p_class, "il2cpp_class_from_name") NEED(p_method, "il2cpp_class_get_method_from_name")
-    NEED(p_class_type, "il2cpp_class_get_type") NEED(p_type_obj, "il2cpp_type_get_object")
-    NEED(p_invoke, "il2cpp_runtime_invoke")
-    WANT(p_fields, "il2cpp_class_get_fields") WANT(p_field_flags, "il2cpp_field_get_flags")
-    WANT(p_field_type, "il2cpp_field_get_type") WANT(p_field_name, "il2cpp_field_get_name")
-    WANT(p_class_from_type, "il2cpp_class_from_type") WANT(p_static_get, "il2cpp_field_static_get_value")
-    WANT(p_array_len, "il2cpp_array_length")
- 
-    size_t n = 0; void** asms = p_assemblies(p_domain_get(), &n);
-    void *csharp = nullptr, *core = nullptr;
-    for (size_t i = 0; i < n; i++) {
-        void* img = p_image(asms[i]); const char* nm = p_image_name(img);
-        if (!strcmp(nm, "Assembly-CSharp.dll")) csharp = img;
-        else if (!strcmp(nm, "UnityEngine.CoreModule.dll")) core = img;
+    g_rt->BeginDraw();
+    g_rt->Clear(D2D1::ColorF(0, 0, 0, 0));   // полностью прозрачный фон
+
+    D2D1_SIZE_F sz = g_rt->GetSize();
+
+    // Пример: мягкая пульсирующая виньетка по краям (чисто декоративная, ничего игровое не трогает)
+    float pulse = 0.15f + 0.08f * (float)sin(g_time * 1.5);
+    ID2D1RadialGradientStopCollection* stops = nullptr;
+    D2D1_GRADIENT_STOP gs[2] = {
+        { 0.0f, D2D1::ColorF(0, 0, 0, 0.0f) },
+        { 1.0f, D2D1::ColorF(0.1f, 0.6f, 1.0f, pulse) }
+    };
+    g_rt->CreateGradientStopCollection(gs, 2, &stops);
+    if (stops) {
+        ID2D1RadialGradientBrush* brush = nullptr;
+        D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES props = D2D1::RadialGradientBrushProperties(
+            D2D1::Point2F(sz.width / 2, sz.height / 2), D2D1::Point2F(0, 0),
+            sz.width * 0.75f, sz.height * 0.75f);
+        g_rt->CreateRadialGradientBrush(props, stops, &brush);
+        if (brush) {
+            g_rt->FillRectangle(D2D1::RectF(0, 0, sz.width, sz.height), brush);
+            brush->Release();
+        }
+        stops->Release();
     }
-    if (!csharp || !core) { LogS("[resolve] Assembly-CSharp / CoreModule not found"); g_failed = true; return false; }
-    g_gmClass = p_class(csharp, "", "GameMaster");
-    g_objClass = p_class(core, "UnityEngine", "Object");
-    void* resCls = p_class(core, "UnityEngine", "Resources");
-    if (!g_gmClass || !g_objClass) { LogS("[resolve] class GameMaster/Object not found"); g_failed = true; return false; }
-    g_findMethod = p_method(g_objClass, "FindObjectOfType", 1);
-    if (!g_findMethod) g_findMethod = p_method(g_objClass, "FindFirstObjectByType", 1);
-    if (resCls) g_findAllMethod = p_method(resCls, "FindObjectsOfTypeAll", 1);
-    LogS("[resolve] FindObjectOfType: ", g_findMethod ? "yes" : "NO");
-    LogS("[resolve] FindObjectsOfTypeAll: ", g_findAllMethod ? "yes" : "NO");
-    g_resolved = true;
-    return true;
-}
- 
-// 1) статическое поле типа GameMaster (синглтон), имя поля зашифровано, поэтому ищем по типу
-static void* FindStatic()
-{
-    if (!p_fields || !p_field_flags || !p_field_type || !p_class_from_type || !p_static_get) return nullptr;
-    void* it = nullptr; void* f;
-    while ((f = p_fields(g_gmClass, &it)) != nullptr) {
-        if (!(p_field_flags(f) & 0x10)) continue;               // FIELD_ATTRIBUTE_STATIC
-        void* fc = p_class_from_type(p_field_type(f));
-        if (fc != g_gmClass) continue;
-        void* val = nullptr; p_static_get(f, &val);
-        LogS("[find] static field of type GameMaster: ", p_field_name ? p_field_name(f) : "?");
-        if (val) return val;
-    }
-    return nullptr;
-}
- 
-static void* FindInstance()
-{
-    void* inst = FindStatic();
-    if (inst) { LogS("[find] via static field"); return inst; }
- 
-    void* typeObj = p_type_obj(p_class_type(g_gmClass));
-    void* args[1] = { typeObj }; void* exc = nullptr;
-    if (g_findMethod) {
-        inst = p_invoke(g_findMethod, nullptr, args, &exc);
-        LogS("[find] FindObjectOfType exception: ", exc ? "YES" : "no");
-        if (inst) { LogS("[find] via FindObjectOfType"); return inst; }
-    }
-    if (g_findAllMethod && p_array_len) {
-        exc = nullptr;
-        void* arr = p_invoke(g_findAllMethod, nullptr, args, &exc);
-        LogS("[find] FindObjectsOfTypeAll exception: ", exc ? "YES" : "no");
-        if (arr) {
-            unsigned len = p_array_len(arr);
-            LogN("[find] FindObjectsOfTypeAll count: ", (long)len);
-            if (len > 0) { inst = ((void**)((char*)arr + 32))[0]; LogS("[find] via FindObjectsOfTypeAll"); return inst; }
+
+    // Пример: текст в углу (FPS-заглушка — просто показывает, что рендер живой)
+    if (g_font) {
+        ID2D1SolidColorBrush* textBrush = nullptr;
+        g_rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f), &textBrush);
+        wchar_t buf[64];
+        swprintf_s(buf, L"Overlay active  t=%.1f", g_time);
+        if (textBrush) {
+            g_rt->DrawText(buf, (UINT32)wcslen(buf), g_font,
+                D2D1::RectF(16, 16, sz.width - 16, 60), textBrush);
+            textBrush->Release();
         }
     }
-    return nullptr;
+
+    g_rt->EndDraw();
 }
- 
-static void CallGM(const char* method)
+// ---- конец блока с эффектами ----
+
+static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
-    LogS("[call] ", method);
-    if (!Resolve()) { LogS("[call] resolve failed"); MessageBeep(MB_ICONERROR); return; }
-    void* inst = FindInstance();
-    void* mth = p_method(g_gmClass, method, 0);
-    LogS("[call] instance: ", inst ? "found" : "NOT FOUND");
-    LogS("[call] method: ", mth ? "found" : "NOT FOUND");
-    if (!inst || !mth) { MessageBeep(MB_ICONERROR); return; }
-    void* exc = nullptr;
-    p_invoke(mth, inst, nullptr, &exc);
-    LogS("[call] exception: ", exc ? "YES" : "no");
-    MessageBeep(exc ? MB_ICONERROR : MB_OK);
-}
- 
-// Выполняется в потоке окна Unity = главный поток игры.
-static LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM w, LPARAM l)
-{
-    if (msg == WM_KEYDOWN && !(l & 0x40000000)) {   // без автоповтора
-        switch (w) {
-        case VK_F1: CallGM("ToggleInvincibility"); break;
-        case VK_F2: CallGM("ToggleInfiniteAmmo"); break;
-        case VK_F3: CallGM("ToggleInfiniteStamina"); break;
-        case VK_F4: CallGM("ToggleNoClipPerms"); break;
-        case VK_F5: CallGM("ToggleIgnoreAI"); break;
-        case VK_F6: CallGM("ToggleSlowMoPerms"); break;
-        case VK_F7: CallGM("ToggleHideUI"); break;
-        case VK_F8: CallGM("SpawnCash"); break;
-        }
+    switch (msg) {
+    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_SIZE:
+        if (g_rt) g_rt->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
+        return 0;
     }
-    return CallWindowProcW(g_orig, h, msg, w, l);
+    return DefWindowProcW(h, msg, w, l);
 }
- 
-static BOOL CALLBACK Enum(HWND h, LPARAM)
+
+static void MakeClickThrough(HWND h)
 {
-    DWORD pid; GetWindowThreadProcessId(h, &pid);
-    wchar_t cls[64]; GetClassNameW(h, cls, 64);
-    if (pid == GetCurrentProcessId() && !wcscmp(cls, L"UnityWndClass")) { g_wnd = h; return FALSE; }
-    return TRUE;
+    // Окно прозрачно для кликов: мышь и клавиатура проходят в игру под ним.
+    SetWindowLongW(h, GWL_EXSTYLE,
+        GetWindowLongW(h, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
+    SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
 }
- 
-static DWORD WINAPI Init(LPVOID)
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
-    for (int i = 0; i < 600 && !g_wnd; i++) { EnumWindows(Enum, 0); Sleep(100); }
-    if (g_wnd) g_orig = (WNDPROC)SetWindowLongPtrW(g_wnd, GWLP_WNDPROC, (LONG_PTR)Proc);
-    LogS("[init] v3 window hooked: ", g_orig ? "yes" : "NO");
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"OverlayWndClass";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    g_hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"OverlayWndClass", L"Overlay", WS_POPUP,
+        0, 0, sw, sh, nullptr, nullptr, hInst, nullptr);
+    MakeClickThrough(g_hwnd);
+
+    // Включаем прозрачность через DWM (чтобы работало и в полноэкранном borderless-режиме)
+    MARGINS m = { -1 };
+    DwmExtendFrameIntoClientArea(g_hwnd, &m);
+
+    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_factory);
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&g_dwrite);
+    if (g_dwrite) g_dwrite->CreateTextFormat(L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        18.0f, L"", &g_font);
+    CreateDeviceResources(g_hwnd);
+
+    ShowWindow(g_hwnd, SW_SHOW);
+
+    DWORD t0 = GetTickCount();
+    MSG msg;
+    bool running = true;
+    while (running) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) running = false;
+            TranslateMessage(&msg); DispatchMessageW(&msg);
+        }
+        // Выход: Ctrl+Alt+F12
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState(VK_F12) & 0x8000))
+            running = false;
+
+        g_time = (GetTickCount() - t0) / 1000.0;
+        Render();
+        Sleep(16);   // ~60 FPS
+    }
+
+    if (g_font) g_font->Release();
+    if (g_dwrite) g_dwrite->Release();
+    if (g_rt) g_rt->Release();
+    if (g_factory) g_factory->Release();
     return 0;
 }
- 
-BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
-{
-    if (reason == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(mod); CreateThread(nullptr, 0, Init, nullptr, 0, nullptr); }
-    return TRUE;
-}
- 
