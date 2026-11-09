@@ -23,9 +23,7 @@ static void CreateDeviceResources(HWND hwnd)
         D2D1::RenderTargetProperties(),
         D2D1::HwndRenderTargetProperties(hwnd, size),
         &g_rt);
-}
 
-// ---- Сюда добавляются новые визуальные эффекты ----
 static void Render()
 {
     g_rt->BeginDraw();
