@@ -4,10 +4,12 @@
 //
 // Клавиши:
 // INSERT       — показать / скрыть оверлей
-// F8           — тестовый запуск RGB-кубиков (когда оверлей открыт)
+// ЛКМ          — RGB-кубики в месте нажатия мыши
+// F8           — тестовый запуск RGB-кубиков в центре экрана
 // CTRL+ALT+F12 — закрыть оверлей
+//
 // Сборка:
-
+// g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
 
 #include <windows.h>
 #include <math.h>
@@ -175,7 +177,16 @@ static DWORD WINAPI OverlayThread(LPVOID)
             break;
         }
 
-        // F8 запускает тестовые частицы только при открытом оверлее.
+        // ЛКМ: частицы появляются в месте нажатия мыши.
+        // Оверлей прозрачен для кликов, поэтому нажатие проходит в игру.
+        if (g_visible && (GetAsyncKeyState(VK_LBUTTON) & 1)) {
+            POINT cursorPos;
+            if (GetCursorPos(&cursorPos)) {
+                SpawnParticles(cursorPos.x, cursorPos.y);
+            }
+        }
+
+        // F8 — тестовый запуск частиц в центре экрана.
         if (g_visible && (GetAsyncKeyState(VK_F8) & 1)) {
             SpawnParticles(screenW / 2, screenH / 2);
         }
@@ -264,7 +275,7 @@ static DWORD WINAPI OverlayThread(LPVOID)
             swprintf(textBuffer, 96,
                      L"GoreBox Visuals | %.1f sec", elapsed);
 
-            RECT textRect = { 16, 16, screenW - 16, 48 };
+            RECT textRect = { 16, screenH - 52, screenW - 16, screenH - 20 };
             DrawTextW(dc, textBuffer, -1, &textRect,
                       DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
