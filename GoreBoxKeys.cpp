@@ -1,142 +1,129 @@
+// GoreBoxKeys.cpp — прозрачный оверлей поверх экрана в виде DLL (GoreBoxKeys.dll).
+// НЕ инжектится в игру и не трогает её память: отдельное окно без рамки, всегда поверх,
+// клики проходят сквозь него в игру.
+// Рисует: пульсирующая рамка по краям экрана + прицел в центре + счётчик времени.
+// Выход из оверлея: Ctrl+Alt+F12.
+//
+// ВАЖНО: workflow собирает ТОЛЬКО с -luser32, поэтому здесь используются
+// исключительно функции user32/kernel32 (никаких GDI/D2D/DWrite/DwmApi).
+//
+// Сборка (как в GitHub Actions):
+//   g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -luser32
+
 #include <windows.h>
-#include <dwmapi.h>
-#include <d2d1.h>
-#include <dwrite.h>
-#include <string>
-#pragma comment(lib, "d2d1.lib")
-#pragma comment(lib, "dwrite.lib")
-#pragma comment(lib, "dwmapi.lib")
+#include <wchar.h>
 
-static ID2D1Factory* g_factory;
-static ID2D1HwndRenderTarget* g_rt;
-static IDWriteFactory* g_dwrite;
-static IDWriteTextFormat* g_font;
 static HWND g_hwnd;
-static double g_time;
+static bool g_running;
 
-static void CreateDeviceResources(HWND hwnd)
-{
-    if (g_rt) return;
-    RECT rc; GetClientRect(hwnd, &rc);
-    D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
-    g_factory->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
-        D2D1::HwndRenderTargetProperties(hwnd, size),
-        &g_rt);
-
-static void Render()
-{
-    g_rt->BeginDraw();
-    g_rt->Clear(D2D1::ColorF(0, 0, 0, 0));   // полностью прозрачный фон
-
-    D2D1_SIZE_F sz = g_rt->GetSize();
-
-    // Пример: мягкая пульсирующая виньетка по краям (чисто декоративная, ничего игровое не трогает)
-    float pulse = 0.15f + 0.08f * (float)sin(g_time * 1.5);
-    ID2D1RadialGradientStopCollection* stops = nullptr;
-    D2D1_GRADIENT_STOP gs[2] = {
-        { 0.0f, D2D1::ColorF(0, 0, 0, 0.0f) },
-        { 1.0f, D2D1::ColorF(0.1f, 0.6f, 1.0f, pulse) }
-    };
-    g_rt->CreateGradientStopCollection(gs, 2, &stops);
-    if (stops) {
-        ID2D1RadialGradientBrush* brush = nullptr;
-        D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES props = D2D1::RadialGradientBrushProperties(
-            D2D1::Point2F(sz.width / 2, sz.height / 2), D2D1::Point2F(0, 0),
-            sz.width * 0.75f, sz.height * 0.75f);
-        g_rt->CreateRadialGradientBrush(props, stops, &brush);
-        if (brush) {
-            g_rt->FillRectangle(D2D1::RectF(0, 0, sz.width, sz.height), brush);
-            brush->Release();
-        }
-        stops->Release();
-    }
-
-    // Пример: текст в углу (FPS-заглушка — просто показывает, что рендер живой)
-    if (g_font) {
-        ID2D1SolidColorBrush* textBrush = nullptr;
-        g_rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f), &textBrush);
-        wchar_t buf[64];
-        swprintf_s(buf, L"Overlay active  t=%.1f", g_time);
-        if (textBrush) {
-            g_rt->DrawText(buf, (UINT32)wcslen(buf), g_font,
-                D2D1::RectF(16, 16, sz.width - 16, 60), textBrush);
-            textBrush->Release();
-        }
-    }
-
-    g_rt->EndDraw();
-}
-// ---- конец блока с эффектами ----
-
+// ---- Обработчик окна ----
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
-    switch (msg) {
-    case WM_DESTROY: PostQuitMessage(0); return 0;
-    case WM_SIZE:
-        if (g_rt) g_rt->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
+    if (msg == WM_DESTROY) {
+        g_running = false;
         return 0;
     }
     return DefWindowProcW(h, msg, w, l);
 }
 
-static void MakeClickThrough(HWND h)
+// ---- Поток оверлея ----
+static DWORD WINAPI OverlayThread(LPVOID)
 {
-    // Окно прозрачно для кликов: мышь и клавиатура проходят в игру под ним.
-    SetWindowLongW(h, GWL_EXSTYLE,
-        GetWindowLongW(h, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
-    SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
-}
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
-{
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.lpszClassName = L"OverlayWndClass";
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"GoreBoxOverlayWnd";
+    // фон = системный цвет окна: он же становится цветовым ключом прозрачности
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
 
-    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+
     g_hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        L"OverlayWndClass", L"Overlay", WS_POPUP,
+        L"GoreBoxOverlayWnd", L"GoreBoxOverlay", WS_POPUP,
         0, 0, sw, sh, nullptr, nullptr, hInst, nullptr);
-    MakeClickThrough(g_hwnd);
+    if (!g_hwnd) return 0;
 
-    // Включаем прозрачность через DWM (чтобы работало и в полноэкранном borderless-режиме)
-    MARGINS m = { -1 };
-    DwmExtendFrameIntoClientArea(g_hwnd, &m);
-
-    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_factory);
-    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&g_dwrite);
-    if (g_dwrite) g_dwrite->CreateTextFormat(L"Segoe UI", nullptr,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-        18.0f, L"", &g_font);
-    CreateDeviceResources(g_hwnd);
-
+    // Делаем цвет окна (обычно белый) полностью прозрачным; всё остальное — видимо
+    SetLayeredWindowAttributes(g_hwnd, GetSysColor(COLOR_WINDOW), 255, LWA_COLORKEY);
     ShowWindow(g_hwnd, SW_SHOW);
 
+    const COLORREF keyColor = GetSysColor(COLOR_WINDOW);
+    HBRUSH brushBg     = GetSysColorBrush(COLOR_WINDOW);      // фон (прозрачный)
+    HBRUSH brushDark   = GetSysColorBrush(COLOR_WINDOWTEXT);    // чёрная рамка / прицел
+    HBRUSH brushGray   = GetSysColorBrush(COLOR_GRAYTEXT);      // серая рамка (фаза пульса)
+
     DWORD t0 = GetTickCount();
-    MSG msg;
-    bool running = true;
-    while (running) {
+    g_running = true;
+    wchar_t buf[64];
+    RECT rc;
+
+    while (g_running) {
+        MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) running = false;
-            TranslateMessage(&msg); DispatchMessageW(&msg);
+            if (msg.message == WM_QUIT) g_running = false;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
         // Выход: Ctrl+Alt+F12
-        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState(VK_F12) & 0x8000))
-            running = false;
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+            (GetAsyncKeyState(VK_MENU) & 0x8000) &&
+            (GetAsyncKeyState(VK_F12) & 0x8000))
+            g_running = false;
 
-        g_time = (GetTickCount() - t0) / 1000.0;
-        Render();
+        double t = (GetTickCount() - t0) / 1000.0;
+        // треугольная "пульсация" 0..1 без математической библиотеки
+        double phase = t * 1.2;
+        phase -= (int)phase;
+        double pulse = phase < 0.5 ? phase * 2.0 : (1.0 - phase) * 2.0;
+
+        HDC dc = GetDC(g_hwnd);
+        if (dc) {
+            GetClientRect(g_hwnd, &rc);
+
+            // 1) заливаем фон ключевым цветом — он прозрачный
+            FillRect(dc, &rc, brushBg);
+
+            // 2) пульсирующая рамка по краям: чёрная <-> серая
+            HBRUSH frameBrush = (pulse < 0.5) ? brushDark : brushGray;
+            int th = 6 + (int)(pulse * 6.0);   // толщина тоже "дышит"
+            RECT r;
+            r.left = 0;        r.top = 0;           r.right = sw;       r.bottom = th;      FillRect(dc, &r, frameBrush);
+            r.left = 0;        r.top = sh - th;    r.right = sw;       r.bottom = sh;      FillRect(dc, &r, frameBrush);
+            r.left = 0;        r.top = 0;           r.right = th;       r.bottom = sh;      FillRect(dc, &r, frameBrush);
+            r.left = sw - th;  r.top = 0;           r.right = sw;       r.bottom = sh;      FillRect(dc, &r, frameBrush);
+
+            // 3) прицел в центре экрана (чёрный, видимый поверх игры)
+            int cx = sw / 2, cy = sh / 2, arm = 18, gap = 5, w = 2;
+            r.left = cx - arm; r.top = cy - w / 2; r.right = cx - gap;  r.bottom = cy + w / 2; FillRect(dc, &r, brushDark);
+            r.left = cx + gap; r.top = cy - w / 2; r.right = cx + arm;  r.bottom = cy + w / 2; FillRect(dc, &r, brushDark);
+            r.left = cx - w / 2; r.top = cy - arm; r.right = cx + w / 2; r.bottom = cy - gap; FillRect(dc, &r, brushDark);
+            r.left = cx - w / 2; r.top = cy + gap; r.right = cx + w / 2; r.bottom = cy + arm; FillRect(dc, &r, brushDark);
+
+            // 4) текст в углу (чёрный текст на белом фоне; белый = прозрачный ключ)
+            swprintf(buf, 64, L"GoreBox overlay  t=%.1f", t);
+            RECT tr = { 16, 16, sw - 16, 48 };
+            DrawTextW(dc, buf, -1, &tr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+
+            ReleaseDC(g_hwnd, dc);
+        }
         Sleep(16);   // ~60 FPS
     }
 
-    if (g_font) g_font->Release();
-    if (g_dwrite) g_dwrite->Release();
-    if (g_rt) g_rt->Release();
-    if (g_factory) g_factory->Release();
+    DestroyWindow(g_hwnd);
     return 0;
+}
+
+// ---- Точка входа DLL: при загрузке запускаем поток оверлея ----
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH) {
+        HANDLE th = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
+        if (th) CloseHandle(th);
+    }
+    return TRUE;
 }
