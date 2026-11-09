@@ -211,26 +211,31 @@ static DWORD WINAPI OverlayThread(LPVOID)
             GetClientRect(g_hwnd, &clientRect);
             FillRect(dc, &clientRect, backgroundBrush);
 
-            // Уменьшенный RGB-прицел с цветным внешним слоем.
+            // DC_BRUSH / DC_PEN позволяют менять цвета без создания
+            // множества GDI-объектов каждый кадр.
+            HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(DC_BRUSH));
+            HGDIOBJ oldPen = SelectObject(dc, GetStockObject(DC_PEN));
+            SetBkMode(dc, TRANSPARENT);
+
+            // Компактный неоновый прицел: тонкий белый центр + RGB-кант.
             const int cx = screenW / 2;
             const int cy = screenH / 2;
-            const int arm = 10;
-            const int gap = 4;
+            const int arm = 9;
+            const int gap = 5;
 
             SetDCBrushColor(dc, HueColor(hue));
-
-            DrawRect(dc, drawingBrush, cx - arm - 2, cy - 2,
-                     arm - gap + 2, 4);
+            SetDCPenColor(dc, HueColor(hue));
+            DrawRect(dc, drawingBrush, cx - arm - 1, cy - 2,
+                     arm - gap + 1, 4);
             DrawRect(dc, drawingBrush, cx + gap, cy - 2,
-                     arm - gap + 2, 4);
-            DrawRect(dc, drawingBrush, cx - 2, cy - arm - 2,
-                     4, arm - gap + 2);
+                     arm - gap + 1, 4);
+            DrawRect(dc, drawingBrush, cx - 2, cy - arm - 1,
+                     4, arm - gap + 1);
             DrawRect(dc, drawingBrush, cx - 2, cy + gap,
-                     4, arm - gap + 2);
+                     4, arm - gap + 1);
 
-            // Светлая тонкая середина прицела.
-            SetDCBrushColor(dc, RGB(255, 255, 255));
-
+            SetDCBrushColor(dc, RGB(245, 250, 255));
+            SetDCPenColor(dc, RGB(245, 250, 255));
             DrawRect(dc, drawingBrush, cx - arm, cy - 1,
                      arm - gap, 2);
             DrawRect(dc, drawingBrush, cx + gap, cy - 1,
@@ -240,7 +245,9 @@ static DWORD WINAPI OverlayThread(LPVOID)
             DrawRect(dc, drawingBrush, cx - 1, cy + gap,
                      2, arm - gap);
 
-            // Обновление и отрисовка тестовых кубиков.
+            // RGB-кубики. Несколько слоёв создают более выразительный
+            // неоновый вид без дополнительных графических библиотек.
+            int aliveParticles = 0;
             for (int i = 0; i < MAX_PARTICLES; ++i) {
                 Particle& p = particles[i];
                 if (p.life <= 0.0f)
@@ -254,34 +261,88 @@ static DWORD WINAPI OverlayThread(LPVOID)
                 if (p.life <= 0.0f)
                     continue;
 
+                ++aliveParticles;
                 const COLORREF cubeColor =
-                    HueColor(p.hue + elapsed * 0.25f);
-
+                    HueColor(p.hue + elapsed * 0.22f);
                 const int x = (int)p.x;
                 const int y = (int)p.y;
+                const int s = p.size;
+
+                SetDCBrushColor(dc, RGB(30, 35, 55));
+                SetDCPenColor(dc, cubeColor);
+                DrawRect(dc, drawingBrush, x - 2, y - 2, s + 4, s + 4);
 
                 SetDCBrushColor(dc, cubeColor);
-                DrawRect(dc, drawingBrush, x, y, p.size, p.size);
+                SetDCPenColor(dc, cubeColor);
+                DrawRect(dc, drawingBrush, x, y, s, s);
 
-                // Маленький белый блик.
-                SetDCBrushColor(dc, RGB(255, 255, 255));
-                DrawRect(dc, drawingBrush, x + 1, y + 1, 2, 2);
+                SetDCBrushColor(dc, RGB(245, 250, 255));
+                SetDCPenColor(dc, RGB(245, 250, 255));
+                DrawRect(dc, drawingBrush, x + 1, y + 1,
+                         (s > 3 ? 2 : 1), (s > 3 ? 2 : 1));
             }
 
-            // Небольшая подпись в левом верхнем углу.
-            SetBkMode(dc, TRANSPARENT);
+            // Стильная нижняя HUD-плашка в духе современных visual-клиентов.
+            const int panelX = 22;
+            const int panelY = screenH - 91;
+            const int panelW = 278;
+            const int panelH = 66;
+
+            // Тень и тёмная стеклянная карточка.
+            SetDCBrushColor(dc, RGB(8, 10, 18));
+            SetDCPenColor(dc, RGB(8, 10, 18));
+            RoundRect(dc, panelX + 3, panelY + 4,
+                      panelX + panelW + 3, panelY + panelH + 4, 14, 14);
+
+            SetDCBrushColor(dc, RGB(17, 21, 34));
+            SetDCPenColor(dc, RGB(48, 57, 78));
+            RoundRect(dc, panelX, panelY,
+                      panelX + panelW, panelY + panelH, 14, 14);
+
+            // Неоновая акцентная полоса слева.
+            SetDCBrushColor(dc, HueColor(hue));
+            SetDCPenColor(dc, HueColor(hue));
+            RoundRect(dc, panelX + 8, panelY + 10,
+                      panelX + 12, panelY + panelH - 10, 4, 4);
+
+            // Заголовок и состояние.
+            SetTextColor(dc, RGB(245, 248, 255));
+            RECT titleRect = {
+                panelX + 23, panelY + 9,
+                panelX + panelW - 12, panelY + 31
+            };
+            DrawTextW(dc, L"GOREBOX  /  VISUALS", -1, &titleRect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+            // Цветная точка состояния.
+            SetDCBrushColor(dc, RGB(70, 235, 170));
+            SetDCPenColor(dc, RGB(70, 235, 170));
+            Ellipse(dc, panelX + 23, panelY + 41,
+                    panelX + 31, panelY + 49);
+
+            SetTextColor(dc, RGB(170, 185, 208));
+            RECT infoRect = {
+                panelX + 38, panelY + 36,
+                panelX + panelW - 10, panelY + 55
+            };
+            swprintf(textBuffer, 96, L"CLICK FX  %d   |   F8: TEST",
+                     aliveParticles);
+            DrawTextW(dc, textBuffer, -1, &infoRect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+            // Маленькая цветная метка в правом верхнем углу карточки.
             SetTextColor(dc, HueColor(hue));
+            RECT tagRect = {
+                panelX + panelW - 68, panelY + 10,
+                panelX + panelW - 12, panelY + 28
+            };
+            DrawTextW(dc, L"ACTIVE", -1, &tagRect,
+                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-            swprintf(textBuffer, 96,
-                     L"GoreBox Visuals | %.1f sec", elapsed);
-
-            RECT textRect = { 16, screenH - 52, screenW - 16, screenH - 20 };
-            DrawTextW(dc, textBuffer, -1, &textRect,
-                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
-
+            SelectObject(dc, oldPen);
+            SelectObject(dc, oldBrush);
             ReleaseDC(g_hwnd, dc);
         }
-
         Sleep(16);
     }
 
