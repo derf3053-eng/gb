@@ -5,7 +5,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -luser32
+      - run: g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
       - uses: actions/upload-artifact@v4
         with:
           name: GoreBoxKeys
