@@ -1,13 +1,31 @@
-name: build
-on: [push, workflow_dispatch]
+name: сборка
+
+on:
+  push:
+  workflow_dispatch:
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
-      - uses: actions/upload-artifact@v4
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Установить MinGW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+
+      - name: Собрать GoreBoxKeys.dll
+        run: x86_64-w64-mingw32-g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
+
+      - name: Собрать мод SpawnProbe
+        run: python3 make_spawnprobe.py
+
+      - name: Выложить артефакты
+        uses: actions/upload-artifact@v4
         with:
-          name: GoreBoxKeys
-          path: GoreBoxKeys.dll
-          
+          name: GoreBox-Build
+          path: |
+            GoreBoxKeys.dll
+            SpawnProbe_GoreBox15.zip
