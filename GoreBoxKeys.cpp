@@ -466,3 +466,14 @@ static DWORD WINAPI OverlayThread(LPVOID)
     g_hwnd = nullptr;
     return 0;
 }
+
+// ---- Точка входа DLL: при загрузке запускаем поток оверлея ----
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH) {
+        HANDLE th = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
+        if (th)
+            CloseHandle(th);
+    }
+    return TRUE;
+}
