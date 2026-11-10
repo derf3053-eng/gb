@@ -1,4 +1,5 @@
-name: сборка
+
+name: Build GoreBox ESP
 
 on:
   push:
@@ -6,26 +7,65 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+
     steps:
-      - name: Получить исходники
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Установить MinGW
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install BepInEx template
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-mingw-w64-x86-64
+          dotnet new install BepInEx.Templates::2.0.0-be.4 --nuget-source https://nuget.bepinex.dev/v3/index.json
 
-      - name: Собрать GoreBoxKeys.dll
-        run: x86_64-w64-mingw32-g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
+      - name: Create IL2CPP project
+        shell: pwsh
+        run: |
+          dotnet new bep6plugin_unity_il2cpp -n GoreBoxESP
 
-      - name: Собрать мод SpawnProbe
-        run: python3 make_spawnprobe.py
+      - name: Create test plugin
+        shell: pwsh
+        run: |
+          @'
+          using BepInEx;
+          using BepInEx.Unity.IL2CPP;
 
-      - name: Выложить артефакты
+          [BepInPlugin("gorebox.visuals.esp", "GoreBox ESP", "1.0.0")]
+          [BepInProcess("HuesBox.exe")]
+          public class GoreBoxESP : BasePlugin
+          {
+              public override void Load()
+              {
+                  Log.LogInfo("GoreBox ESP plugin loaded!");
+              }
+          }
+          '@ | Set-Content GoreBoxESP/Plugin.cs -Encoding utf8
+
+      - name: Build DLL
+        shell: pwsh
+        run: |
+          dotnet build GoreBoxESP/GoreBoxESP.csproj -c Release
+
+      - name: Collect DLL
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem GoreBoxESP/bin/Release -Filter GoreBoxESP.dll -Recurse |
+            Where-Object { $_.FullName -notmatch '[\\/]+ref[\\/]' } |
+            Select-Object -First 1
+
+          if (-not $dll) {
+            throw "GoreBoxESP.dll was not found"
+          }
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $dll.FullName dist/GoreBoxESP.dll
+
+      - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
-          name: GoreBox-Build
-          path: |
-            GoreBoxKeys.dll
-            SpawnProbe_GoreBox15.zip
+          name: GoreBoxESP
+          path: dist/GoreBoxESP.dll
