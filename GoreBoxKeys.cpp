@@ -8,7 +8,6 @@
 // F8           — тестовый запуск RGB-кубиков в центре экрана
 // F7           — включить / выключить постоянно парящие частицы
 // CTRL+ALT+F12 — закрыть оверлей
-//
 // Сборка:
 // g++ -shared -O2 -static -o GoreBoxKeys.dll GoreBoxKeys.cpp -lgdi32 -luser32
 
